@@ -35,6 +35,7 @@
   - [Phase 4 — M3 Raw Consequence Generator](#phase4)
   - [Phase 5 — M4 P/G Projector](#phase5)
   - [Phase 6 — Integration & MVP acceptance](#phase6)
+  - [Phase 7 — M4 dynamic extension (LLM fallback / learned projector)](#phase7)
 - [Part D — Testing strategy (all levels)](#part-d)
 - [Part E — Deferred work (do not build)](#part-e)
 - [Appendix 1 — Frozen vocabularies](#appendix1)
@@ -1313,10 +1314,103 @@ rerun stability                       true    PASS  (full-signature, determinist
 | True M1→M2→M3→M4→M5 dataflow + propagation | ✅ **built** (Part F fix 2) |
 | B1–B10 §18 rubric | ✅ recall 0.913, sign 1.0, absent 0 (B8 partial: child/cohesion horizon) |
 | **Meets gateable §19 exit criterion** | ✅ **met** — recall ≥ 0.90, sign ≥ 0.80, R1–R3 = 0, unmappable 0, pruned 0, absent 0 |
-| Learned projector (replaces hand rules, §22.6) | ⏭ deferred — needs labeled data |
+| Learned projector (replaces hand rules, §22.6) | ◑ **dynamic fallback built** (Phase 7) — LLM fills undefined inputs, caches as learned rules; full swap-in of the static table still deferred to labeled data |
 | 100 held-out annotated set + §19 calibration | ⏭ deferred — data collection |
 | Claude `ClaudeProvider` + LLM-baseline comparison | ⏭ deferred — see Phase 4 seam |
 | Calibration session (λ, w_P, G anchoring) + psychological layer | ⏭ deferred (Part E) |
+
+---
+
+<a name="phase7"></a>
+## Phase 7 — M4 dynamic extension (LLM fallback / learned projector)
+
+### What it does
+Realizes the spec §17 / §22.6 *"swap in a learned projector as labeled data
+accrues"* hook, but as an **on-demand LLM fallback** rather than a batch-trained
+model. When M4 meets an **undefined input** — an `unmappable` mechanic, or a
+mapped mechanism with no static projector rule — it consults a **write-through
+learned store**; on a cache miss it asks Claude for the named impacts, then
+caches the answer keyed by mechanic so the same input is **never asked twice**.
+The static rule table always wins; the LLM only fills gaps it left open.
+
+This is **additive and opt-in**: with no store/provider, M4 behaves exactly as
+in Phase 5 (the §5.4 explicit-ignorance fallback is preserved), so the MVP
+acceptance numbers are unchanged.
+
+### What to build
+- `learned_store.py` — `LearnedRuleStore` (load / get / write-through `put` /
+  `learn`) over `config/learned_rules.json`. `LearnedRule` has the **same shape**
+  M4 reads for static rules (`p_rules`, `g_rules`, `reliability`).
+- `providers/projection_provider.py` — `ProjectionProvider` (Protocol) +
+  `ClaudeProjectionProvider` (live). Mirrors the Phase 4 LLM seam.
+- `modules/m4_projector.py` — `project(...)` gains optional `learned_store` /
+  `llm_provider` params and a `dynamic(step, key)` path; static rules take
+  precedence.
+- `schemas/raw_trace.py` — `TraceStep.raw_mechanic` (the original scene
+  mechanic) so the store is keyed by mechanic type even when `mechanism`
+  collapsed to `unmappable`.
+- `pipeline.py` — a `--dynamic` flag (needs `ANTHROPIC_API_KEY`). The store
+  **always** loads so cached answers replay offline; the live provider is built
+  only when `--dynamic` is on **and** a key is present.
+
+**7.1 LLM contract** (mirrors the Phase 4 M3 seam):
+```
+model            "claude-opus-4-8", official `anthropic` SDK (dep `anthropic>=0.69`)
+output           client.messages.parse(output_format=LLMProjection)  -> structured
+thinking         {"type": "adaptive"}
+determinism      opus-4-8 removes temperature/top_p/seed; reproducibility comes
+                 from CACHING outputs and replaying offline, never from sampling.
+                 The LLM is consulted only on a cache miss.
+```
+
+**7.2 Validate-and-clamp at learn time** (`llm_to_learned`) — structured-output
+JSON schemas reject numeric bounds, so magnitudes/reliability are **clamped to
+[0,1]** when stored, and any row whose dimension is invalid for its target kind
+is **dropped**. `member_welfare` is never accepted (M5's alone, R1).
+
+### Conformance to the frozen v1.6.1 contracts
+The dynamic layer is the §22.6 *learned projector*, so it inherits — not
+relaxes — every gated M4 contract:
+
+| Contract (spec) | How it holds |
+|---|---|
+| Explicit ignorance (§5.4) | preserved when no store/provider: `delta 0`, `uncertainty 1.0` |
+| Uncertainty authored, not guessed (§5.2) | learned `reliability` feeds `rule_reliability` in the same `1 − conf·rel·hf` formula |
+| `delta ∈ [−1,+1]`, pre-saturation (I5) | clamped at learn time and on aggregation |
+| `member_welfare` never authored by M4 (§5.5, R1) | dropped at learn time; `GProjection` cannot express it |
+| G items limited to `cohesion`/`continuity` (§5.5) | enforced by the `GProjection` type + drop rule |
+| Closed P-dim / G-var vocab (§10) | emitted payloads stay in-vocab; learned keys live in the **store**, not the trace's mechanism vocabulary |
+| Rerun stability (§19.7) | write-through cache replays deterministically, no network |
+
+### How to run
+```powershell
+# Offline: replays any cached rules, never calls the network
+python -m behavioral_layer.pipeline --scenario B2 --pretty
+
+# Dynamic: asks Claude for undefined inputs, then caches them
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+python -m behavioral_layer.pipeline --scenario B2 --dynamic --pretty
+```
+
+### How to test (`test_m4_dynamic.py`)
+| Test | Proves |
+|---|---|
+| `test_cache_miss_calls_llm_and_writes_store` | a miss consults the LLM once, writes through to disk, and the projection uses the learned reliability |
+| `test_cache_hit_does_not_call_llm` | a second run reloads from disk and never touches the provider |
+| `test_backward_compat_explicit_ignorance` | no store/provider → today's `delta 0` / `uncertainty 1.0` per affected party |
+| `test_store_offline_replay_without_provider` | a seeded store applies its rule with **no** provider present |
+| `test_store_roundtrip_and_apply_does_not_override_static` | learned rules merge in; static rules are untouched on conflict |
+| `test_llm_to_learned_clamps_and_drops_invalid` | magnitudes/reliability clamped; `member_welfare` and invalid dims dropped |
+
+### Exit criteria
+`99 passed` for the whole suite (Phases 0–7); `ruff` + `mypy` clean. The MVP
+acceptance numbers (Phase 6) are unchanged because the extension is gated off by
+default.
+
+> **Note — `config/learned_rules.json`** ships as the empty seed `{}`. It is
+> written through at runtime in `--dynamic` runs, so expect it to show as
+> modified after a live session; `git rm --cached` it if you'd rather it not be
+> tracked.
 
 ---
 
